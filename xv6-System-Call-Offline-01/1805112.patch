@@ -1,0 +1,330 @@
+diff --git a/Makefile b/Makefile
+index 39a99d7..7d96bd8 100644
+--- a/Makefile
++++ b/Makefile
+@@ -125,6 +125,8 @@ UPROGS=\
+ 	$U/_ln\
+ 	$U/_ls\
+ 	$U/_mkdir\
++	$U/_trace\
++	$U/_sysinfotest\
+ 	$U/_rm\
+ 	$U/_sh\
+ 	$U/_stressfs\
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a3c962b..3bfa54d 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -63,6 +63,7 @@ void            ramdiskrw(struct buf*);
+ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
++int             freemem(void);
+ 
+ // log.c
+ void            initlog(int, struct superblock*);
+@@ -106,6 +107,7 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++int             aliveproc(void);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index 0699e7e..772e7a5 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -80,3 +80,18 @@ kalloc(void)
+     memset((char*)r, 5, PGSIZE); // fill with junk
+   return (void*)r;
+ }
++
++// free memory list traversing
++int
++freemem(void)
++{
++  int n = 0;
++  struct run *r;
++  acquire(&kmem.lock);
++
++  for(r = kmem.freelist; r; r = r->next)
++    n++;
++  release(&kmem.lock);
++
++  return n * PGSIZE;
++}
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 959b778..8470297 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -169,6 +169,7 @@ freeproc(struct proc *p)
+   p->killed = 0;
+   p->xstate = 0;
+   p->state = UNUSED;
++  p->tracer = 0;  // setting invalid value while freeing
+ }
+ 
+ // Create a user page table for a given process, with no user memory,
+@@ -681,3 +682,20 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++// tracking existing procedure count
++int
++aliveproc(void)
++{
++  int n = 0;
++  struct proc *p;
++
++  for (p = proc; p < &proc[NPROC]; p++)
++  {
++    acquire(&p->lock);
++    if(p->state != UNUSED)
++      n++;
++    release(&p->lock);
++  }
++  return n;
++}
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..05f3a13 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -91,6 +91,7 @@ struct proc {
+   int killed;                  // If non-zero, have been killed
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
++  int tracer;
+ 
+   // wait_lock must be held when using this:
+   struct proc *parent;         // Parent process
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..942fee4 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_trace(void);  // added later
++extern uint64 sys_sysinfo(void);  // added later
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +128,35 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_trace]   sys_trace, // added later
++[SYS_sysinfo] sys_sysinfo, // added later
++};
++
++// system call name mapping
++char *syscalltitles[] = {
++[SYS_fork]    "fork",
++[SYS_exit]    "exit",
++[SYS_wait]    "wait",
++[SYS_pipe]    "pipe",
++[SYS_read]    "read",
++[SYS_kill]    "kill",
++[SYS_exec]    "exec",
++[SYS_fstat]   "fstat",
++[SYS_chdir]   "chdir",
++[SYS_dup]     "dup",
++[SYS_getpid]  "getpid",
++[SYS_sbrk]    "sbrk",
++[SYS_sleep]   "sleep",
++[SYS_uptime]  "uptime",
++[SYS_open]    "open",
++[SYS_write]   "write",
++[SYS_mknod]   "mknod",
++[SYS_unlink]  "unlink",
++[SYS_link]    "link",
++[SYS_mkdir]   "mkdir",
++[SYS_close]   "close",
++[SYS_trace]   "trace", // added later 
++[SYS_sysinfo] "sysinfo", // added later
+ };
+ 
+ void
+@@ -144,4 +175,9 @@ syscall(void)
+             p->pid, p->name, num);
+     p->trapframe->a0 = -1;
+   }
++
++  // added for tracing system call
++  if (p->tracer == num){
++    printf("pid: %d, syscall: %s, return value: %d\n",p->pid, syscalltitles[num], p->trapframe->a0);
++  }
+ }
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..0185b27 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_trace  22
++#define SYS_sysinfo   23
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 1de184e..93e9168 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -89,3 +89,21 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++// setting the tracer value
++uint64
++sys_trace(void)
++{
++  argint(0, &myproc()->tracer);
++  return 0;
++}
++
++// printing system info to the console
++uint64
++sys_sysinfo(void)
++{
++  printf("\nsysinfo system call prints:\n");
++  printf("free-memory: %d bytes\n", freemem());
++  printf("n_proc  : %d\n\n", aliveproc());
++  return 0;
++}
+diff --git a/user/sysinfotest.c b/user/sysinfotest.c
+new file mode 100644
+index 0000000..25ade16
+--- /dev/null
++++ b/user/sysinfotest.c
+@@ -0,0 +1,72 @@
++#include "kernel/types.h"
++#include "kernel/riscv.h"
++#include "user/user.h"
++
++
++void
++sinfo() {
++  if (sysinfo() < 0) {
++    printf("FAIL: sysinfo failed");
++    exit(1);
++  }
++}
++
++
++void
++testmem() {
++  printf("\n\t\t\tTesting memory\n");
++  printf("\nInitial State\n");
++  sinfo();
++
++  printf("Using up one more page (4094 bytes).\nFreemem should reduce by that much!\n");
++  if((uint64)sbrk(PGSIZE) == 0xffffffffffffffff){
++    printf("sbrk failed");
++    exit(1);
++  }
++
++  sinfo();
++
++  printf("Giving back that one more page to the pool (4094 bytes).\nFreemem should go back to the initial value!\n");
++  
++  if((uint64)sbrk(-PGSIZE) == 0xffffffffffffffff){
++    printf("sbrk failed");
++    exit(1);
++  }
++
++  sinfo();
++}
++
++void testproc() {
++  int status;
++  int pid;
++
++  printf("\n\t\t\tTesting nproc\n");
++  printf("\nInitial State\n");
++  sinfo();
++
++  pid = fork();
++  if(pid < 0){
++    printf("sysinfotest: fork failed\n");
++    exit(1);
++  }
++  if(pid == 0){  // inside the child process
++    printf("Created one new process. So nproc should increase by 1.");
++    sinfo();
++    exit(0);
++  }
++
++  wait(&status); // wait for the created child process to end
++  printf("Created process ended. So nproc should go back to initial value.");
++  sinfo(); 
++}
++
++
++int
++main(int argc, char *argv[])
++{
++  printf("sysinfotest: start\n");
++  testmem();
++  testproc();
++  printf("sysinfotest: done\n");
++  exit(0);
++}
+diff --git a/user/trace.c b/user/trace.c
+new file mode 100644
+index 0000000..1e322ce
+--- /dev/null
++++ b/user/trace.c
+@@ -0,0 +1,27 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int
++main(int argc, char *argv[])
++{
++  int i;
++  char *nargv[MAXARG];
++
++  if(argc < 3 || (argv[1][0] < '0' || argv[1][0] > '9')){
++    fprintf(2, "Usage: %s sys_call_num command\n", argv[0]);
++    exit(1);
++  }
++
++  if (trace(atoi(argv[1])) < 0) {
++    fprintf(2, "%s: trace failed\n", argv[0]);
++    exit(1);
++  }
++  
++  for(i = 2; i < argc && i < MAXARG; i++){
++    nargv[i-2] = argv[i];
++  }
++  exec(nargv[0], nargv);
++  exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index 4d398d5..b8500b8 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -22,6 +22,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int trace(int);
++int sysinfo(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..bc109fd 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("trace");
++entry("sysinfo");
