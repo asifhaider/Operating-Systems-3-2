@@ -1,1 +1,1 @@
-/home/asif/Desktop/Local Repository Ubuntu/CSE-314-Operating-Systems/xv6-System-Call-Offline-01/Note.md
+../Note.md
