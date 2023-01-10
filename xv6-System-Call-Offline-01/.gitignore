@@ -1,0 +1,8 @@
+*~
+_*
+*.o
+*.d
+*.asm
+*.sym
+*.img
+README
